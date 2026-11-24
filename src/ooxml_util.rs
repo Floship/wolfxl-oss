@@ -276,7 +276,7 @@ pub fn zip_read_to_string_opt<R: Read + Seek>(
     }
 }
 
-fn resolve_zip_name_case_insensitive<R: Read + Seek>(
+pub(crate) fn resolve_zip_name_case_insensitive<R: Read + Seek>(
     zip: &ZipArchive<R>,
     name: &str,
 ) -> PyResult<Option<String>> {

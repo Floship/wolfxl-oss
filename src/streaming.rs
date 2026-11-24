@@ -24,8 +24,8 @@
 //! sheets and inflates large sheets from the ZIP entry as rows are read.
 
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
-use std::sync::Arc;
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::sync::{Arc, Mutex};
 
 use flate2::read::DeflateDecoder;
 use pyo3::exceptions::{PyIOError, PyMemoryError, PyStopIteration, PyValueError};
@@ -139,10 +139,20 @@ fn load_sst<R: Read + Seek>(zip: &mut ZipArchive<R>) -> PyResult<Vec<String>> {
         None => return Ok(Vec::new()),
     };
 
-    let mut reader = XmlReader::from_str(&xml);
+    let mut out = Vec::new();
+    parse_sst(XmlReader::from_str(&xml), |value| {
+        out.push(value.to_owned());
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn parse_sst<R: BufRead>(
+    mut reader: XmlReader<R>,
+    mut consume: impl FnMut(&str) -> PyResult<()>,
+) -> PyResult<()> {
     reader.config_mut().trim_text(false);
     let mut buf: Vec<u8> = Vec::new();
-    let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut in_si = false;
     let mut in_t = false;
@@ -171,7 +181,7 @@ fn load_sst<R: Read + Seek>(zip: &mut ZipArchive<R>) -> PyResult<Vec<String>> {
                 let name = e.local_name();
                 match name.as_ref().as_bytes() {
                     b"si" => {
-                        out.push(std::mem::take(&mut current));
+                        consume(&current)?;
                         in_si = false;
                     }
                     b"t" => {
@@ -181,6 +191,7 @@ fn load_sst<R: Read + Seek>(zip: &mut ZipArchive<R>) -> PyResult<Vec<String>> {
                     _ => {}
                 }
             }
+            Ok(Event::Empty(e)) if e.local_name().as_ref() == "si" => consume("")?,
             Ok(Event::Text(t)) => {
                 if in_si && in_t {
                     current.push_str(&normalize_xml_eol(&t));
@@ -201,7 +212,7 @@ fn load_sst<R: Read + Seek>(zip: &mut ZipArchive<R>) -> PyResult<Vec<String>> {
         }
         buf.clear();
     }
-    Ok(out)
+    Ok(())
 }
 
 /// XML end-of-line handling (XML 1.0 section 2.11): a literal CR LF pair or
@@ -242,7 +253,75 @@ fn resolve_sheet_xml_path<R: Read + Seek>(
 /// materialized once rather than once per cell. The native xlsx backend builds
 /// its table from the native reader's entries, so its eager reads and the
 /// streaming readers it hands the table to share one `str` per entry.
+const DISK_STRING_CACHE_SLOTS: usize = 1024;
+const DISK_STRING_CACHE_MAX_BYTES: usize = 256;
+
+struct DiskStrings {
+    offsets: File,
+    values: File,
+    cache: Vec<Option<(usize, String)>>,
+    count: usize,
+}
+
+impl DiskStrings {
+    fn from_archive<R: Read + Seek>(zip: &mut ZipArchive<R>) -> PyResult<Self> {
+        let mut offsets = BufWriter::new(tempfile::tempfile()?);
+        let mut values = BufWriter::new(tempfile::tempfile()?);
+        let mut next_offset = 0u64;
+        let mut count = 0usize;
+        let name = ooxml_util::resolve_zip_name_case_insensitive(zip, "xl/sharedStrings.xml")?;
+        if let Some(name) = name {
+            let entry = zip
+                .by_name(&name)
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            ooxml_util::validate_zip_entry_metadata(&name, entry.size(), entry.compressed_size())?;
+            parse_sst(XmlReader::from_reader(BufReader::new(entry)), |value| {
+                offsets.write_all(&next_offset.to_le_bytes())?;
+                values.write_all(value.as_bytes())?;
+                next_offset += value.len() as u64;
+                count += 1;
+                Ok(())
+            })?;
+        }
+        offsets.write_all(&next_offset.to_le_bytes())?;
+        Ok(Self {
+            offsets: offsets.into_inner().map_err(|err| err.into_error())?,
+            values: values.into_inner().map_err(|err| err.into_error())?,
+            cache: vec![None; DISK_STRING_CACHE_SLOTS],
+            count,
+        })
+    }
+
+    fn get_py(&mut self, py: Python<'_>, idx: usize) -> PyResult<PyObjectOwned> {
+        if idx >= self.count {
+            return str_to_py(py, "");
+        }
+        let slot = (idx ^ (idx >> 10)) % self.cache.len();
+        if let Some((key, text)) = self.cache[slot].as_ref() {
+            if *key == idx {
+                return str_to_py(py, text);
+            }
+        }
+        let mut pair = [0u8; 16];
+        self.offsets.seek(SeekFrom::Start(idx as u64 * 8))?;
+        self.offsets.read_exact(&mut pair)?;
+        let offset = u64::from_le_bytes(pair[..8].try_into().unwrap());
+        let next = u64::from_le_bytes(pair[8..].try_into().unwrap());
+        let mut bytes = vec![0; (next - offset) as usize];
+        self.values.seek(SeekFrom::Start(offset))?;
+        self.values.read_exact(&mut bytes)?;
+        let text = String::from_utf8(bytes).map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let value = str_to_py(py, &text)?;
+        if text.len() <= DISK_STRING_CACHE_MAX_BYTES {
+            self.cache[slot] = Some((idx, text));
+        }
+        Ok(value)
+    }
+}
+
 pub(crate) struct SharedStringTable {
+    disk: Option<Mutex<DiskStrings>>,
+    disk_count: usize,
     strings: Vec<Arc<str>>,
     py_strings: Box<[PyOnceLock<PyObjectOwned>]>,
 }
@@ -256,17 +335,25 @@ impl SharedStringTable {
     pub(crate) fn from_shared(strings: Vec<Arc<str>>) -> Self {
         let py_strings = strings.iter().map(|_| PyOnceLock::new()).collect();
         Self {
+            disk: None,
+            disk_count: 0,
             strings,
             py_strings,
         }
     }
 
     fn len(&self) -> usize {
-        self.strings.len()
+        self.strings.len() + self.disk_count
     }
 
     /// Python `str` of entry `idx`; an index past the table reads as `""`.
     pub(crate) fn get_py(&self, py: Python<'_>, idx: usize) -> PyResult<PyObjectOwned> {
+        if let Some(disk) = &self.disk {
+            return disk
+                .lock()
+                .map_err(|_| PyIOError::new_err("shared strings lock poisoned"))?
+                .get_py(py, idx);
+        }
         let (Some(text), Some(slot)) = (self.strings.get(idx), self.py_strings.get(idx)) else {
             return str_to_py(py, "");
         };
@@ -309,6 +396,23 @@ impl StreamingSharedStrings {
         let zip = ZipArchive::new(WorkbookBytesCursor::new(&data))
             .map_err(|e| PyErr::new::<PyIOError, _>(format!("Failed to open zip: {e}")))?;
         Self::from_archive(zip)
+    }
+
+    /// Prototype for bounded-memory reads of high-cardinality shared strings.
+    #[staticmethod]
+    pub fn load_disk(path: &str) -> PyResult<Self> {
+        let file = File::open(path)?;
+        let mut zip = ZipArchive::new(file).map_err(|err| PyIOError::new_err(err.to_string()))?;
+        ooxml_util::validate_zip_archive(&mut zip)?;
+        let disk = DiskStrings::from_archive(&mut zip)?;
+        Ok(Self {
+            sst: Arc::new(SharedStringTable {
+                disk_count: disk.count,
+                disk: Some(Mutex::new(disk)),
+                strings: Vec::new(),
+                py_strings: Vec::new().into_boxed_slice(),
+            }),
+        })
     }
 
     fn __len__(&self) -> usize {

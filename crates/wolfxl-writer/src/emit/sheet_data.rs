@@ -27,7 +27,9 @@ pub fn emit(out: &mut String, sheet: &Worksheet, sst: &mut SstBuilder) {
 
     out.push_str("<sheetData>");
     sheet
-        .visit_logical_rows(|row_num, row, dense| emit_merged_row_to(out, row_num, row, dense, sst))
+        .visit_logical_rows(|row_num, row, dense| {
+            emit_merged_row_to(out, row_num, row, dense, Some(sst))
+        })
         .expect("formatting into a String is infallible");
     out.push_str("</sheetData>");
 }
@@ -50,7 +52,7 @@ pub(crate) fn emit_to<W: std::io::Write>(
         }
         out.write_str("<sheetData>")?;
         sheet.visit_logical_rows(|row_num, row, dense| {
-            emit_merged_row_to(&mut out, row_num, row, dense, sst)
+            emit_merged_row_to(&mut out, row_num, row, dense, Some(sst))
         })?;
         out.write_str("</sheetData>")
     })();
@@ -76,7 +78,7 @@ pub(crate) fn emit_row_to<W: fmt::Write>(
     out: &mut W,
     row_num: u32,
     row: &Row,
-    sst: &mut SstBuilder,
+    sst: Option<&mut SstBuilder>,
 ) -> fmt::Result {
     emit_merged_row_to(out, row_num, Some(row), &[], sst)
 }
@@ -86,7 +88,7 @@ fn emit_merged_row_to<W: fmt::Write>(
     row_num: u32,
     row: Option<&Row>,
     dense_rows: &[DenseRow],
-    sst: &mut SstBuilder,
+    mut sst: Option<&mut SstBuilder>,
 ) -> fmt::Result {
     let (has_cells, has_real_cells) = if row.is_none_or(|row| row.cells.is_empty()) {
         (
@@ -133,7 +135,7 @@ fn emit_merged_row_to<W: fmt::Write>(
 
     out.write_char('>')?;
     visit_merged_row_cells(row, dense_rows, |col_num, cell| {
-        emit_cell_to(out, row_num, col_num, cell, sst)
+        emit_cell_to(out, row_num, col_num, cell, sst.as_deref_mut())
     })?;
     out.write_str("</row>")
 }
@@ -143,7 +145,7 @@ fn emit_cell_to<W: fmt::Write>(
     row_num: u32,
     col_num: u32,
     cell: &WriteCell,
-    sst: &mut SstBuilder,
+    sst: Option<&mut SstBuilder>,
 ) -> fmt::Result {
     let cell_ref = refs::A1Ref::new(row_num, col_num);
 
@@ -162,8 +164,23 @@ fn emit_cell_to<W: fmt::Write>(
             write!(out, "><v>{}</v></c>", format_number(*n))?;
         }
 
+        WriteCellValue::String(s) if sst.is_none() => {
+            write!(out, "<c r=\"{}\" t=\"inlineStr\"", cell_ref)?;
+            if let Some(style) = cell.style_id {
+                write!(out, " s=\"{}\"", style)?;
+            }
+            out.write_str("><is><t xml:space=\"preserve\">")?;
+            let mut segments = s.split('\r');
+            xml_escape::write_text_to(out, segments.next().unwrap_or_default())?;
+            for segment in segments {
+                out.write_str("&#13;")?;
+                xml_escape::write_text_to(out, segment)?;
+            }
+            out.write_str("</t></is></c>")?;
+        }
+
         WriteCellValue::String(s) => {
-            let idx = sst.intern(s);
+            let idx = sst.expect("shared string mode").intern(s);
             write!(out, "<c r=\"{}\" t=\"s\"", cell_ref)?;
             if let Some(style) = cell.style_id {
                 write!(out, " s=\"{}\"", style)?;
@@ -570,7 +587,7 @@ mod tests {
         let mut streaming_sst = SstBuilder::default();
         let mut streaming = String::new();
         let row = sheet.rows.get(&1).unwrap();
-        emit_row_to(&mut streaming, 1, row, &mut streaming_sst).unwrap();
+        emit_row_to(&mut streaming, 1, row, Some(&mut streaming_sst)).unwrap();
 
         // The eager path wraps with <sheetData>...</sheetData>; strip it
         // off so the row payload is comparable.

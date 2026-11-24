@@ -57,6 +57,7 @@ use crate::model::worksheet::Row;
 /// [`crate::model::worksheet::Worksheet::rows`].
 #[derive(Debug)]
 pub struct StreamingSheet {
+    inline_strings: bool,
     /// Open temp file backing this sheet's `<sheetData>` body.
     /// Wrapped in `Option` so [`StreamingSheet::finalize`] can
     /// drop the file handle while keeping the path alive for the
@@ -94,6 +95,7 @@ impl StreamingSheet {
         // actual writes.
         let writer_file = file.reopen()?;
         Ok(Self {
+            inline_strings: std::env::var_os("WOLFXL_PROBE_INLINE").is_some(),
             file: Some(file),
             writer: Some(BufWriter::with_capacity(64 * 1024, writer_file)),
             row_count: 0,
@@ -121,7 +123,12 @@ impl StreamingSheet {
         // Row encoder writes UTF-8 bytes through the adapter. fmt::Error
         // bubbles up only if write_str failed; we surface the original
         // io::Error captured by the adapter.
-        match emit_row_to(&mut adapter, row_num, row, sst) {
+        match emit_row_to(
+            &mut adapter,
+            row_num,
+            row,
+            (!self.inline_strings).then_some(sst),
+        ) {
             Ok(()) => {
                 self.row_count = self.row_count.saturating_add(1);
                 let n_cols = row.cells.keys().copied().max().unwrap_or(0);
