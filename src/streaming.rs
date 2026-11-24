@@ -273,9 +273,93 @@ const DISK_STRING_VALUE_BYTES: usize = 128 * 1024;
 const DISK_STRING_SPOOL_BYTES: u64 = 512 * 1024 * 1024;
 const DISK_STRING_ROW_BYTES: usize = 8 * 1024 * 1024;
 
+const DISK_STRING_READ_WINDOW_BYTES: usize = 4096;
+
+struct DiskReadWindow {
+    start: u64,
+    len: usize,
+    bytes: Box<[u8; DISK_STRING_READ_WINDOW_BYTES]>,
+}
+
+impl Default for DiskReadWindow {
+    fn default() -> Self {
+        Self {
+            start: 0,
+            len: 0,
+            bytes: Box::new([0; DISK_STRING_READ_WINDOW_BYTES]),
+        }
+    }
+}
+
+impl DiskReadWindow {
+    fn get(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let start = usize::try_from(offset.checked_sub(self.start)?).ok()?;
+        self.bytes[..self.len].get(start..start.checked_add(len)?)
+    }
+}
+
+/// Two small read-ahead windows retain both the advancing scan and a second
+/// neighborhood of indexes referenced by interleaved shared values.
+struct DiskStringFile {
+    file: File,
+    len: u64,
+    windows: [DiskReadWindow; 2],
+}
+
+impl DiskStringFile {
+    fn new(file: File, len: u64) -> Self {
+        Self {
+            file,
+            len,
+            windows: Default::default(),
+        }
+    }
+
+    fn read_exact_at(&mut self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        if out.len() > DISK_STRING_READ_WINDOW_BYTES {
+            return read_spool_at(&mut self.file, offset, out);
+        }
+        for (i, window) in self.windows.iter().enumerate() {
+            if let Some(bytes) = window.get(offset, out.len()) {
+                out.copy_from_slice(bytes);
+                self.windows.swap(0, i);
+                return Ok(());
+            }
+        }
+        let available = self.len.saturating_sub(offset);
+        if available < out.len() as u64 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        let window = &mut self.windows[1];
+        let len = available.min(DISK_STRING_READ_WINDOW_BYTES as u64) as usize;
+        window.len = 0;
+        read_spool_at(&mut self.file, offset, &mut window.bytes[..len])?;
+        window.start = offset;
+        window.len = len;
+        out.copy_from_slice(&window.bytes[..out.len()]);
+        self.windows.swap(0, 1);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn read_spool_at(file: &mut File, offset: u64, out: &mut [u8]) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(out, offset)
+}
+
+#[cfg(not(unix))]
+fn read_spool_at(file: &mut File, offset: u64, out: &mut [u8]) -> io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(out)
+}
+
 struct DiskStrings {
-    offsets: File,
-    values: File,
+    offsets: DiskStringFile,
+    values: DiskStringFile,
     cache: Box<[Option<(usize, String)>]>,
     count: usize,
 }
@@ -319,8 +403,14 @@ impl DiskStrings {
         )?;
         offsets.write_all(&next_offset.to_le_bytes())?;
         Ok(Some(Self {
-            offsets: offsets.into_inner().map_err(|err| err.into_error())?,
-            values: values.into_inner().map_err(|err| err.into_error())?,
+            offsets: DiskStringFile::new(
+                offsets.into_inner().map_err(|err| err.into_error())?,
+                (count as u64 + 1) * 8,
+            ),
+            values: DiskStringFile::new(
+                values.into_inner().map_err(|err| err.into_error())?,
+                next_offset,
+            ),
             cache: vec![None; DISK_STRING_CACHE_SLOTS].into_boxed_slice(),
             count,
         }))
@@ -340,8 +430,7 @@ impl DiskStrings {
             return Ok(Cow::Borrowed(&self.cache[slot].as_ref().unwrap().1));
         }
         let mut pair = [0u8; 16];
-        self.offsets.seek(SeekFrom::Start(idx as u64 * 8))?;
-        self.offsets.read_exact(&mut pair)?;
+        self.offsets.read_exact_at(idx as u64 * 8, &mut pair)?;
         let offset = u64::from_le_bytes(pair[..8].try_into().unwrap());
         let end = u64::from_le_bytes(pair[8..].try_into().unwrap());
         let len = end
@@ -351,8 +440,7 @@ impl DiskStrings {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid shared-string offsets")
             })?;
         let mut bytes = vec![0; len as usize];
-        self.values.seek(SeekFrom::Start(offset))?;
-        self.values.read_exact(&mut bytes)?;
+        self.values.read_exact_at(offset, &mut bytes)?;
         let text = String::from_utf8(bytes)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         if text.len() <= DISK_STRING_CACHE_VALUE_BYTES {
@@ -3193,6 +3281,36 @@ fn unescape_xml(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_string_windows_read_interleaved_ranges_and_large_values() {
+        let page = DISK_STRING_READ_WINDOW_BYTES;
+        let source: Vec<u8> = (0..5 * page).map(|i| (i % 251) as u8).collect();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&source).unwrap();
+        let mut buffered = DiskStringFile::new(file, source.len() as u64);
+
+        for (start, len) in [
+            (0, 16),
+            (3 * page, 16),
+            (page - 16, 16),
+            (3 * page + 16, 16),
+            (page - 8, 16),
+            (page + 32, 2 * page),
+            (5 * page - 16, 16),
+        ] {
+            let mut out = vec![0; len];
+            buffered.read_exact_at(start as u64, &mut out).unwrap();
+            assert_eq!(out, source[start..start + len]);
+        }
+        assert_eq!(
+            buffered
+                .read_exact_at(source.len() as u64 - 15, &mut [0; 16])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof,
+        );
+    }
 
     #[test]
     fn find_tag_basic() {
