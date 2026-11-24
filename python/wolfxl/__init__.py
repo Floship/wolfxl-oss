@@ -167,6 +167,8 @@ def load_workbook(
     rich_text: bool = False,
     password: str | bytes | None = None,
     limits: Limits | None = None,
+    *,
+    disk_shared_strings: bool = False,
 ) -> Workbook:
     """Open a workbook for reading, streaming, or modify-mode saves.
 
@@ -192,6 +194,11 @@ def load_workbook(
         limits: Workbook-wide XLSX admission budgets. ``None`` uses
             :class:`Limits` defaults. Applies to full, read-only and modify loads,
             including decrypted XLSX inputs. Not supported for XLS or XLSB.
+        disk_shared_strings: Store shared strings in temporary files for XLSX
+            read-only row iteration. Requires flat text (rich_text=False).
+            Adds 1 MiB XML token/cell and 16 MiB raw row limits, a 128 KiB
+            per-string and 8 MiB per-row decoded shared-text limit, and a
+            512 MiB combined spool limit. Existing workbook Limits still apply.
 
     Returns:
         A :class:`Workbook` in read, streaming, or modify mode.
@@ -207,8 +214,16 @@ def load_workbook(
     from wolfxl._loader import classify_input
     from wolfxl._workbook_sources import open_workbook_source
 
+    if type(disk_shared_strings) is not bool:
+        raise TypeError("disk_shared_strings must be a bool")
+    if disk_shared_strings and (not read_only or modify or keep_vba or rich_text):
+        raise ValueError(
+            "disk_shared_strings=True requires read_only=True without modify, keep_vba or rich_text"
+        )
     fmt, data, path = classify_input(filename)
     source_fmt = fmt
+    if disk_shared_strings and fmt not in ("xlsx", "encrypted"):
+        raise ValueError("disk_shared_strings=True requires an XLSX-family workbook")
     if limits is not None and fmt in ("xls", "xlsb"):
         raise NotImplementedError("limits= is supported for XLSX-family workbooks only")
     if limits is None:
@@ -278,14 +293,24 @@ def load_workbook(
             data=data,
             password=password,
             data_only=data_only,
-        keep_links=keep_links,
-        keep_vba=keep_vba,
-        permissive=permissive,
-        modify=modify,
-        read_only=read_only,
-        limits=limits,
+            keep_links=keep_links,
+            keep_vba=keep_vba,
+            permissive=permissive,
+            modify=modify,
+            read_only=read_only,
+            limits=limits,
+            disk_shared_strings=disk_shared_strings,
         ),
     )
+
+    if disk_shared_strings:
+        from wolfxl._streaming import enable_disk_shared_strings
+
+        try:
+            enable_disk_shared_strings(wb)
+        except BaseException:
+            wb.close()
+            raise
 
     if path is not None and source_fmt == "xlsx":
         # XLSX path loads read a private source (a read-only map of the file

@@ -45,7 +45,9 @@ def remove_sheet(wb: Any, worksheet: Worksheet) -> None:
     wb._rust_writer.remove_sheet(title)  # noqa: SLF001
 
 
-def create_sheet(wb: Any, title: str | None, index: int | None = None) -> Worksheet:
+def create_sheet(
+    wb: Any, title: str | None, index: int | None = None, *, inline_strings: bool | None = None
+) -> Worksheet:
     """Create and append a worksheet in write or modify mode.
 
     Args:
@@ -59,6 +61,11 @@ def create_sheet(wb: Any, title: str | None, index: int | None = None) -> Worksh
     Raises:
         RuntimeError: If ``wb`` is not in write mode.
     """
+    if inline_strings is not None:
+        if type(inline_strings) is not bool:
+            raise TypeError("inline_strings must be a bool or None")
+        if not getattr(wb, "_write_only", False):
+            raise ValueError("inline_strings is a write-only sheet option")
     title = _unique_sheet_title(wb, title)
     insert_at = _normalize_insert_index(wb, index)
     if wb._rust_patcher is None and wb._rust_writer is None:  # noqa: SLF001
@@ -79,8 +86,14 @@ def create_sheet(wb: Any, title: str | None, index: int | None = None) -> Worksh
         from wolfxl._worksheet_write_only import WriteOnlyWorksheet
 
         wb._rust_writer.add_sheet(title)  # noqa: SLF001
+        if inline_strings is None:
+            inline_strings = getattr(wb, "_inline_strings", False)
+        try:
+            ws = WriteOnlyWorksheet(wb, title, inline_strings=inline_strings)
+        except Exception:
+            wb._rust_writer.remove_sheet(title)  # noqa: SLF001
+            raise
         wb._sheet_names.insert(insert_at, title)  # noqa: SLF001
-        ws = WriteOnlyWorksheet(wb, title)
         wb._sheets[title] = ws  # noqa: SLF001
         _move_new_writer_sheet_to_index(wb, title, insert_at)
         return ws  # type: ignore[return-value]

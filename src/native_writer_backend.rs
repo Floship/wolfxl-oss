@@ -280,8 +280,9 @@ impl NativeWorkbook {
 
     /// Convert an empty existing sheet into streaming write-only mode.
     /// Idempotent. Errors if the sheet already has eager rows.
-    pub fn enable_streaming_sheet(&mut self, sheet: &str) -> PyResult<()> {
-        enable_streaming(&mut self.inner, sheet)
+    #[pyo3(signature = (sheet, *, inline_strings=false))]
+    pub fn enable_streaming_sheet(&mut self, sheet: &str, inline_strings: bool) -> PyResult<()> {
+        enable_streaming(&mut self.inner, sheet, inline_strings)
     }
 
     /// Append one row's worth of cell payloads to a streaming sheet's

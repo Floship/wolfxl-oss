@@ -37,7 +37,11 @@ use crate::native_writer_cells::payload_to_write_cell_value;
 /// The sheet must exist (created by an earlier `add_sheet`) and must
 /// not already have any eager rows or merges installed — streaming and
 /// eager modes are mutually exclusive.
-pub(crate) fn enable_streaming(wb: &mut Workbook, name: &str) -> PyResult<()> {
+pub(crate) fn enable_streaming(
+    wb: &mut Workbook,
+    name: &str,
+    inline_strings: bool,
+) -> PyResult<()> {
     let idx = wb
         .sheets
         .iter()
@@ -45,8 +49,14 @@ pub(crate) fn enable_streaming(wb: &mut Workbook, name: &str) -> PyResult<()> {
         .ok_or_else(|| PyValueError::new_err(format!("Unknown sheet: {name}")))?;
     let ws = &mut wb.sheets[idx];
 
-    if ws.streaming.is_some() {
-        return Ok(());
+    if let Some(stream) = &ws.streaming {
+        return if stream.uses_inline_strings() == inline_strings {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err(
+                "cannot change a streaming sheet's string mode",
+            ))
+        };
     }
     if !ws.rows.is_empty() || ws.has_dense_rows() {
         return Err(PyValueError::new_err(
@@ -54,7 +64,7 @@ pub(crate) fn enable_streaming(wb: &mut Workbook, name: &str) -> PyResult<()> {
         ));
     }
 
-    let stream = StreamingSheet::new(idx as u32)
+    let stream = StreamingSheet::with_inline_strings(idx as u32, inline_strings)
         .map_err(|e| PyIOError::new_err(format!("streaming temp file open failed: {e}")))?;
     ws.streaming = Some(stream);
     Ok(())

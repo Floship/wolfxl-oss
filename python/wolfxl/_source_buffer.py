@@ -46,6 +46,7 @@ class MappedSource(mmap.mmap):
     """
 
     file_id: tuple[int, int]
+    streaming_file: BinaryIO
 
 
 def snapshot_file(source: BinaryIO, limit: int | None = None) -> bytes | MappedSource:

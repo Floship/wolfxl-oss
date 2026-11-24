@@ -28,6 +28,7 @@ def open_workbook_source(
     modify: bool,
     read_only: bool,
     limits: Limits | None = None,
+    disk_shared_strings: bool = False,
 ) -> Any:
     """Open a classified workbook source through the matching constructor.
 
@@ -51,10 +52,10 @@ def open_workbook_source(
         # a read-only map of the file opened here (a copy on Windows). Never
         # reopen the caller's path after accepting its contents.
         if data is None:
-            data = _snapshot_xlsx_path(path, limits)
+            data = _snapshot_xlsx_path(path, limits, keep_file=disk_shared_strings)
             path = None
         if password is None:
-            limits._validate(data if data is not None else path, permissive=permissive)
+            _validate_xlsx_source(limits, data, permissive, disk_shared_strings)
         if password is not None:
             return from_encrypted(
                 cls,
@@ -68,6 +69,7 @@ def open_workbook_source(
                 modify=modify,
                 read_only=read_only,
                 limits=limits,
+                disk_shared_strings=disk_shared_strings,
             )
         return from_bytes(
             cls,
@@ -79,6 +81,7 @@ def open_workbook_source(
             modify=modify,
             read_only=read_only,
             limits=limits,
+            disk_shared_strings=disk_shared_strings,
         )
 
     if fmt == "xlsb":
@@ -102,13 +105,32 @@ def open_workbook_source(
     raise ValueError(f"unsupported workbook format: {fmt!r}")
 
 
-def _snapshot_xlsx_path(path: str, limits: Limits) -> bytes | mmap.mmap:
-    """Snapshot ``path`` through one opened descriptor within the package budget."""
-    from wolfxl._source_buffer import snapshot_file
+def _validate_xlsx_source(
+    limits: Limits, source: bytes | mmap.mmap, permissive: bool, disk_shared_strings: bool,
+) -> None:
+    if disk_shared_strings:
+        file = getattr(source, "streaming_file", None)
+        limits._validate(
+            source if file is None else file, permissive=permissive, bounded_streaming=True,
+        )
+    else:
+        limits._validate(source, permissive=permissive)
+
+
+def _snapshot_xlsx_path(
+    path: str, limits: Limits, *, keep_file: bool = False,
+) -> bytes | mmap.mmap:
+    """Snapshot ``path`` from one descriptor and retain it for opt-in streaming."""
+    import os
+
+    from wolfxl._source_buffer import MappedSource, snapshot_file
 
     try:
         with open(path, "rb") as source:
-            return snapshot_file(source, limits.max_package_bytes)
+            snapshot = snapshot_file(source, limits.max_package_bytes)
+            if keep_file and isinstance(snapshot, MappedSource):
+                snapshot.streaming_file = os.fdopen(os.dup(source.fileno()), "rb")
+            return snapshot
     except OSError as error:
         raise OSError(f"native xlsx open failed: {error}") from error
 
@@ -360,6 +382,7 @@ def from_encrypted(
     modify: bool = False,
     read_only: bool = False,
     limits: Limits | None = None,
+    disk_shared_strings: bool = False,
 ) -> Any:
     """Open an OOXML-encrypted .xlsx via msoffcrypto-tool."""
     if (path is None) == (data is None):
@@ -369,14 +392,14 @@ def from_encrypted(
 
     limits = limits if limits is not None else Limits()
     if path is not None:
-        data = _snapshot_xlsx_path(path, limits)
+        data = _snapshot_xlsx_path(path, limits, keep_file=disk_shared_strings)
         path = None
     # Normalize mutable input once; plain packages keep this buffer unchanged.
     source = as_source(data)
     is_plain_xlsx = source[:2] == b"PK"
 
     if is_plain_xlsx:
-        limits._validate(source, permissive=permissive)
+        _validate_xlsx_source(limits, source, permissive, disk_shared_strings)
         return from_bytes(
             cls,
             source,
@@ -387,6 +410,7 @@ def from_encrypted(
             modify=modify,
             read_only=read_only,
             limits=limits,
+            disk_shared_strings=disk_shared_strings,
         )
 
     try:
@@ -409,7 +433,7 @@ def from_encrypted(
             is_encrypted = False
 
         if not is_encrypted:
-            limits._validate(source, permissive=permissive)
+            _validate_xlsx_source(limits, source, permissive, disk_shared_strings)
             return from_bytes(
                 cls,
                 source,
@@ -420,6 +444,7 @@ def from_encrypted(
                 modify=modify,
                 read_only=read_only,
                 limits=limits,
+                disk_shared_strings=disk_shared_strings,
             )
 
         try:
@@ -433,7 +458,7 @@ def from_encrypted(
         except Exception as exc:
             raise ValueError(f"failed to decrypt workbook (wrong password?): {exc}") from exc
         decrypted_bytes = buf.getvalue()
-        limits._validate(decrypted_bytes, permissive=permissive)
+        _validate_xlsx_source(limits, decrypted_bytes, permissive, disk_shared_strings)
     finally:
         src_fp.close()
 
@@ -447,6 +472,7 @@ def from_encrypted(
         modify=modify,
         read_only=read_only,
         limits=limits,
+        disk_shared_strings=disk_shared_strings,
     )
 
 
@@ -461,6 +487,7 @@ def from_bytes(
     modify: bool = False,
     read_only: bool = False,
     limits: Limits | None = None,
+    disk_shared_strings: bool = False,
 ) -> Any:
     """Open an .xlsx blob or read-only mapped source."""
     from wolfxl import _rust
@@ -479,7 +506,7 @@ def from_bytes(
                 source = normalized.read()
         finally:
             os.unlink(normalized_path)
-        (limits if limits is not None else Limits())._validate(source, permissive=permissive)
+        _validate_xlsx_source(limits or Limits(), source, permissive, disk_shared_strings)
     reader_cls = _xlsx_reader_class(
         _rust,
         modify=modify,

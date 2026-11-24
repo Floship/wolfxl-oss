@@ -97,7 +97,9 @@ def save_workbook(
     apply_merge_updates(wb, filename)
     apply_workbook_template_content_type(wb, filename)
     apply_custom_doc_props_authoring(wb, filename)
-    apply_formula_results(wb, filename, formula_results, formula_results_stale)
+    # Write-only rows qualify future formulas as they enter the native spool.
+    if formula_results is not None or not getattr(wb, "_write_only", False):
+        apply_formula_results(wb, filename, formula_results, formula_results_stale)
     if filename != destination:
         publish_modify_source(wb, filename, destination)
     # Mark consumed AFTER save succeeds so a write failure leaves the
@@ -219,14 +221,19 @@ def save_workbook_to_fileobj(
     tmp.close()
     try:
         save_workbook(wb, tmp_path, password=password)
-        with open(tmp_path, "rb") as src:
-            data = src.read()
         try:
             fileobj.seek(0)
             fileobj.truncate()
         except Exception:
             pass
-        fileobj.write(data)
+        with open(tmp_path, "rb") as src:
+            while chunk := src.read(1024 * 1024):
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = fileobj.write(remaining)
+                    if written is None or written <= 0:
+                        raise OSError("workbook output stream did not accept the data")
+                    remaining = remaining[written:]
         try:
             fileobj.flush()
         except Exception:

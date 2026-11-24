@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+import mmap
+from typing import BinaryIO
 
 from wolfxl._rust import load_limit_defaults, validate_load_limits
 
@@ -42,9 +44,15 @@ class Limits:
             if type(value) is not int or not 0 <= value <= 2**64 - 1:
                 raise ValueError(f"{field.name} must be an integer between 0 and 2**64 - 1")
 
-    def _validate(self, source: str | bytes, *, permissive: bool = False) -> None:
+    def _validate(
+        self, source: str | bytes | mmap.mmap | BinaryIO, *,
+        permissive: bool = False, bounded_streaming: bool = False,
+    ) -> None:
         try:
-            validate_load_limits(source, *(getattr(self, f.name) for f in fields(self)), permissive)
+            validate_load_limits(
+                source, *(getattr(self, f.name) for f in fields(self)), permissive,
+                bounded_streaming=bounded_streaming,
+            )
         except OSError as error:
             # Preserve the established load error contract for malformed ZIPs.
             raise OSError(f"native xlsx open failed: {error}") from error

@@ -2,7 +2,7 @@ use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek};
+use std::io::{self, BufRead, Read, Seek};
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader as XmlReader;
@@ -12,6 +12,58 @@ use wolfxl_rels::package_guard::{
     DEFAULT_MAX_COMPRESSION_RATIO, DEFAULT_MAX_ZIP_ENTRIES, DEFAULT_MAX_ZIP_ENTRY_BYTES,
     DEFAULT_MAX_ZIP_TOTAL_BYTES,
 };
+
+pub(crate) const STREAM_XML_TOKEN_BYTES: usize = 1024 * 1024;
+pub(crate) const STREAM_CELL_XML_BYTES: u64 = STREAM_XML_TOKEN_BYTES as u64;
+pub(crate) const STREAM_ROW_XML_BYTES: u64 = 16 * STREAM_CELL_XML_BYTES;
+
+/// Bound the bytes quick-xml can buffer while looking for the end of one event.
+pub(crate) struct XmlTokenReader<R> {
+    input: R,
+    remaining: Option<usize>,
+}
+
+impl<R> XmlTokenReader<R> {
+    pub(crate) fn new(input: R) -> Self {
+        Self {
+            input,
+            remaining: None,
+        }
+    }
+
+    pub(crate) fn limit_next_token(&mut self) {
+        self.remaining = Some(STREAM_XML_TOKEN_BYTES);
+    }
+}
+
+impl<R: BufRead> Read for XmlTokenReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let used = self.fill_buf()?.read(out)?;
+        self.consume(used);
+        Ok(used)
+    }
+}
+
+impl<R: BufRead> BufRead for XmlTokenReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        let data = self.input.fill_buf()?;
+        match self.remaining {
+            Some(0) if !data.is_empty() => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "streaming XML token exceeds 1 MiB",
+            )),
+            Some(remaining) => Ok(&data[..data.len().min(remaining)]),
+            None => Ok(data),
+        }
+    }
+
+    fn consume(&mut self, used: usize) {
+        if let Some(remaining) = &mut self.remaining {
+            *remaining -= used;
+        }
+        self.input.consume(used);
+    }
+}
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)

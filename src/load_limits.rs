@@ -11,6 +11,7 @@ use wolfxl_reader::WorkbookBytesCursor;
 use wolfxl_rels::package_guard::{check, LimitExceeded, Limits};
 use zip::ZipArchive;
 
+use crate::ooxml_util::{XmlTokenReader, STREAM_CELL_XML_BYTES, STREAM_ROW_XML_BYTES};
 use crate::py_workbook_bytes::PyWorkbookBytes;
 
 fn limit_error(error: LimitExceeded) -> PyErr {
@@ -43,6 +44,10 @@ pub fn load_limit_defaults() -> (u64, u64, u64, u64, u64, usize, u64) {
 }
 
 #[pyfunction]
+#[pyo3(signature = (source, max_package_bytes, max_part_bytes, max_cells,
+    max_shared_string_bytes, max_materialized_string_bytes, permissive,
+    *, bounded_streaming=false))]
+#[allow(clippy::too_many_arguments)]
 pub fn validate_load_limits(
     source: &Bound<'_, PyAny>,
     max_package_bytes: u64,
@@ -51,6 +56,7 @@ pub fn validate_load_limits(
     max_shared_string_bytes: u64,
     max_materialized_string_bytes: u64,
     permissive: bool,
+    bounded_streaming: bool,
 ) -> PyResult<()> {
     let limits = Limits {
         max_package_bytes,
@@ -59,21 +65,41 @@ pub fn validate_load_limits(
         max_shared_string_bytes,
         max_materialized_string_bytes,
     };
+    #[cfg(unix)]
+    if bounded_streaming && source.hasattr("fileno")? {
+        return validate(
+            crate::streaming::PositionalFile::duplicate(source)?,
+            limits,
+            permissive,
+            bounded_streaming,
+        );
+    }
     if let Ok(path) = source.extract::<String>() {
         validate(
             File::open(path).map_err(|e| PyIOError::new_err(e.to_string()))?,
             limits,
             permissive,
+            bounded_streaming,
         )
     } else {
         // `bytes` or a read-only mapping of the workbook file; the cursor
         // releases consumed mapped pages as the package is scanned.
         let data = PyWorkbookBytes::new(source)?;
-        validate(WorkbookBytesCursor::new(&data), limits, permissive)
+        validate(
+            WorkbookBytesCursor::new(&data),
+            limits,
+            permissive,
+            bounded_streaming,
+        )
     }
 }
 
-fn validate<R: Read + Seek>(source: R, limits: Limits, permissive: bool) -> PyResult<()> {
+fn validate<R: Read + Seek>(
+    source: R,
+    limits: Limits,
+    permissive: bool,
+    bounded_streaming: bool,
+) -> PyResult<()> {
     let mut zip = ZipArchive::new(source).map_err(|e| PyIOError::new_err(e.to_string()))?;
     let mut package_bytes = 0u64;
     // Check the central directory before decompressing any entry.
@@ -105,7 +131,14 @@ fn validate<R: Read + Seek>(source: R, limits: Limits, permissive: bool) -> PyRe
         if !shared && !worksheet {
             continue;
         }
-        let mut reader = Reader::from_reader(BufReader::new(entry));
+        let size = entry.size();
+        let mut reader = Reader::from_reader(XmlTokenReader::new(BufReader::new(entry.take(
+            if bounded_streaming {
+                size.saturating_add(1)
+            } else {
+                u64::MAX
+            },
+        ))));
         let mut buf = Vec::new();
         let mut in_text = false;
         let mut in_formula = false;
@@ -114,8 +147,55 @@ fn validate<R: Read + Seek>(source: R, limits: Limits, permissive: bool) -> PyRe
         let mut formula_index = None;
         let mut formula_len = 0u64;
         let mut shared_formulas: HashMap<String, (Option<u64>, u64)> = HashMap::new();
+        let mut row_start = None;
+        let mut cell_start = None;
+        let mut row_cells = 0;
         loop {
+            let start = reader.buffer_position();
+            if bounded_streaming {
+                reader.get_mut().limit_next_token();
+            }
             let event = reader.read_event_into(&mut buf);
+            if bounded_streaming {
+                let end = reader.buffer_position();
+                if end > size
+                    || row_start.is_some_and(|start| end - start > STREAM_ROW_XML_BYTES)
+                    || cell_start.is_some_and(|start| end - start > STREAM_CELL_XML_BYTES)
+                {
+                    return Err(PyIOError::new_err(
+                        "bounded streaming worksheet XML exceeds its entry, row or cell byte limit",
+                    ));
+                }
+                match &event {
+                    Ok(Event::Start(e)) if worksheet && e.local_name().as_ref() == "row" => {
+                        row_start = Some(start);
+                        row_cells = 0;
+                    }
+                    Ok(Event::Start(e)) if worksheet && e.local_name().as_ref() == "c" => {
+                        cell_start = Some(start);
+                        row_cells += 1;
+                    }
+                    Ok(Event::Empty(e)) if worksheet && e.local_name().as_ref() == "c" => {
+                        row_cells += 1;
+                    }
+                    Ok(Event::End(e)) if worksheet && e.local_name().as_ref() == "row" => {
+                        row_start = None;
+                    }
+                    Ok(Event::End(e)) if worksheet && e.local_name().as_ref() == "c" => {
+                        cell_start = None;
+                    }
+                    Ok(Event::Eof) if end != size => {
+                        return Err(PyIOError::new_err("ZIP entry size does not match its XML"));
+                    }
+                    Err(error) => return Err(PyIOError::new_err(error.to_string())),
+                    _ => {}
+                }
+                if row_cells > 16_384 {
+                    return Err(PyIOError::new_err(
+                        "bounded streaming row exceeds 16384 cells",
+                    ));
+                }
+            }
             let len = match &event {
                 Ok(Event::Text(e)) => Some(normalized_text_len(e)),
                 Ok(Event::CData(e)) => Some(normalized_text_len(e)),

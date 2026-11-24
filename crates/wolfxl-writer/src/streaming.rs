@@ -16,10 +16,8 @@
 //! file's contents into the `<sheetData>` slot. Everything else in the
 //! 38-slot ECMA emit sequence is unchanged.
 //!
-//! What stays in memory: the shared-string table (one entry per unique
-//! string across the whole workbook) and the styles builder. Both
-//! match openpyxl's `lxml.xmlfile` model exactly — they're irreducible
-//! costs of the OOXML format, not wolfxl design choices.
+//! Styles stay in memory. Streaming sheets intern strings by default;
+//! sheets created with inline strings bypass the workbook shared-string table.
 //!
 //! # Lifecycle
 //!
@@ -67,9 +65,10 @@ pub struct StreamingSheet {
     /// Buffer size of 64KiB is tuned to match the typical L2 cache
     /// line so syscall amortisation lines up with cache eviction.
     writer: Option<BufWriter<std::fs::File>>,
-    /// Number of rows appended so far. Used by `<dimension>` emit and
-    /// surfaced to Python via the FFI for diagnostic logging.
+    /// Number of appended rows, which may have gaps between their indexes.
     row_count: u32,
+    /// Highest appended row index, used for the worksheet dimension.
+    max_row: u32,
     /// Highest 1-based column index seen across every appended row.
     /// Used by `<dimension>` emit to compute the bottom-right cell.
     max_col: u32,
@@ -84,6 +83,11 @@ impl StreamingSheet {
     /// Open a fresh per-sheet temp file under `std::env::temp_dir()`
     /// with a `wolfxl-stream-{pid}-{sheet_idx}-` prefix.
     pub fn new(sheet_idx: u32) -> io::Result<Self> {
+        Self::with_inline_strings(sheet_idx, false)
+    }
+
+    /// Open a streaming sheet with an explicit string storage mode.
+    pub fn with_inline_strings(sheet_idx: u32, inline_strings: bool) -> io::Result<Self> {
         let prefix = format!("wolfxl-stream-{}-{}-", std::process::id(), sheet_idx);
         let file = tempfile::Builder::new()
             .prefix(&prefix)
@@ -95,13 +99,18 @@ impl StreamingSheet {
         // actual writes.
         let writer_file = file.reopen()?;
         Ok(Self {
-            inline_strings: std::env::var_os("WOLFXL_PROBE_INLINE").is_some(),
+            inline_strings,
             file: Some(file),
             writer: Some(BufWriter::with_capacity(64 * 1024, writer_file)),
             row_count: 0,
+            max_row: 0,
             max_col: 0,
             last_io_err: None,
         })
+    }
+
+    pub fn uses_inline_strings(&self) -> bool {
+        self.inline_strings
     }
 
     /// Append one row using the same encoder the eager path uses.
@@ -113,6 +122,15 @@ impl StreamingSheet {
     /// invoke [`finalize`] before reading [`temp_path`] for the
     /// splice phase.
     pub fn append_row(&mut self, row_num: u32, row: &Row, sst: &mut SstBuilder) -> io::Result<()> {
+        if let Some(err) = &self.last_io_err {
+            return Err(clone_io_err(err));
+        }
+        if row_num <= self.max_row {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "streaming rows must have increasing positive indexes",
+            ));
+        }
         let writer = self.writer.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "streaming sheet already finalized")
         })?;
@@ -131,6 +149,7 @@ impl StreamingSheet {
         ) {
             Ok(()) => {
                 self.row_count = self.row_count.saturating_add(1);
+                self.max_row = row_num;
                 let n_cols = row.cells.keys().copied().max().unwrap_or(0);
                 if n_cols > self.max_col {
                     self.max_col = n_cols;
@@ -151,11 +170,14 @@ impl StreamingSheet {
     /// call is a no-op so the FFI bridge can call this defensively
     /// before save without tracking finalization state on the Python side.
     pub fn finalize(&mut self) -> io::Result<()> {
-        if let Some(mut writer) = self.writer.take() {
-            writer.flush()?;
+        if let Some(err) = &self.last_io_err {
+            return Err(clone_io_err(err));
         }
-        if let Some(err) = self.last_io_err.take() {
-            return Err(err);
+        if let Some(mut writer) = self.writer.take() {
+            if let Err(err) = writer.flush() {
+                self.last_io_err = Some(clone_io_err(&err));
+                return Err(err);
+            }
         }
         Ok(())
     }
@@ -212,6 +234,10 @@ impl StreamingSheet {
 
     pub fn row_count(&self) -> u32 {
         self.row_count
+    }
+
+    pub fn max_row(&self) -> u32 {
+        self.max_row
     }
 
     pub fn max_col(&self) -> u32 {

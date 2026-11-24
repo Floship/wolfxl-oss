@@ -20,6 +20,7 @@ def close_workbook(workbook: Any) -> None:
     workbook._rust_reader = None
     workbook._streaming_style_cache = None
     workbook._stream_shared_strings = None
+    workbook._disk_stream = None
     workbook._rust_writer = None
     workbook._rust_patcher = None
     _release_mapped_source(workbook)

@@ -47,7 +47,9 @@ class Workbook:
     Excel I/O engine for fast reads, writes, and preserving modify-mode saves.
     """
 
-    def __init__(self, write_only: bool = False, iso_dates: bool = False) -> None:
+    def __init__(
+        self, write_only: bool = False, iso_dates: bool = False, *, inline_strings: bool = False
+    ) -> None:
         """Create a new workbook in write mode.
 
         Args:
@@ -62,7 +64,15 @@ class Workbook:
                 before appending. A workbook saved in write-only mode
                 is consumed-on-save: a second :meth:`save` raises
                 :class:`WorkbookAlreadySaved`.
+            inline_strings: Store text inline on new write-only sheets by default.
+                This avoids retaining unique text in the workbook shared-string table.
         """
+        if type(inline_strings) is not bool:
+            raise TypeError("inline_strings must be a bool")
+        if inline_strings and not write_only:
+            raise ValueError("inline_strings=True requires write_only=True")
+        self._inline_strings = inline_strings
+
         from wolfxl import _backend, _rust  # noqa: F401  (_rust kept for typing parity)
 
         self._rust_writer: Any = _backend.make_writer()
@@ -924,12 +934,17 @@ class Workbook:
     # Write-mode operations
     # ------------------------------------------------------------------
 
-    def create_sheet(self, title: str | None = None, index: int | None = None) -> Worksheet:
+    def create_sheet(
+        self, title: str | None = None, index: int | None = None, *,
+        inline_strings: bool | None = None,
+    ) -> Worksheet:
         """Create and append a worksheet.
 
         Args:
             title: Worksheet title. When omitted, empty, or already present,
                 WolfXL mirrors openpyxl by generating the next unique title.
+            inline_strings: Override the workbook's string storage mode for
+                this write-only sheet. None inherits the workbook setting.
 
         Returns:
             The newly created :class:`Worksheet`.
@@ -939,7 +954,7 @@ class Workbook:
         """
         if getattr(self, "_read_only", False):
             raise ReadOnlyWorkbookException("Cannot create new sheet in a read-only workbook")
-        return _workbook_sheets.create_sheet(self, title, index)
+        return _workbook_sheets.create_sheet(self, title, index, inline_strings=inline_strings)
 
     def _add_sheet(self, worksheet: Worksheet, index: int | None = None) -> None:
         """Openpyxl-compatible private sheet insertion helper."""

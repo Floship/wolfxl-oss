@@ -109,12 +109,39 @@ def _stream_shared_strings(wb: Any, source: str | bytes | mmap.mmap) -> Any:
     return table
 
 
+def enable_disk_shared_strings(wb: Any) -> None:
+    """Build one bounded table before exposing the workbook to callers."""
+    from wolfxl import _rust
+
+    source = stream_source(wb)
+    file = getattr(source, "streaming_file", None)
+    if file is not None:
+        del source.streaming_file
+        table = _rust.StreamingSharedStrings.load_disk_from_file(file)
+    elif isinstance(source, SOURCE_BUFFERS):
+        table = _rust.StreamingSharedStrings.load_disk_from_bytes(source)
+    else:
+        table = _rust.StreamingSharedStrings.load_disk(source)
+    wb._disk_stream = (table, file)
+    wb._disk_shared_strings = True
+
+
 def _open_stream_reader(
     wb: Any, source: str | bytes | mmap.mmap, sheet_title: str, *bounds: int | None
 ) -> Any:
     from wolfxl import _rust
 
-    shared_strings = _stream_shared_strings(wb, source)
+    if getattr(wb, "_disk_shared_strings", False):
+        disk_stream = getattr(wb, "_disk_stream", None)
+        if disk_stream is None:
+            raise ValueError("disk-backed workbook is closed")
+        shared_strings, file = disk_stream
+        if file is not None:
+            return _rust.StreamingSheetReader.open_from_file(
+                file, sheet_title, *bounds, shared_strings=shared_strings,
+            )
+    else:
+        shared_strings = _stream_shared_strings(wb, source)
     if isinstance(source, SOURCE_BUFFERS):
         return _rust.StreamingSheetReader.open_from_bytes(
             source, sheet_title, *bounds, shared_strings=shared_strings
@@ -790,6 +817,9 @@ def stream_value_chunks(
     if chunk_size < 1:
         raise ValueError("chunk_size must be >= 1")
     wb = ws._workbook  # noqa: SLF001
+    bounded = getattr(wb, "_disk_shared_strings", False)
+    if bounded:
+        chunk_size = min(chunk_size, 1024)
 
     path = stream_source(wb)
     if path is None:
@@ -858,6 +888,9 @@ def stream_value_chunks(
                     yield tuple(pending)
                     pending = []
                 counter = row_idx + 1
+            if bounded and pending:
+                yield tuple(pending)
+                pending = []
         if stream_mx_r is not None and _pad_trailing_rows(wb, reader, mx_r):
             while counter <= stream_mx_r:
                 pending.append(empty_row)

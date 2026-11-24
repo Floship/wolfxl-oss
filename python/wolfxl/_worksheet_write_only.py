@@ -140,7 +140,9 @@ class WriteOnlyWorksheet:
       :class:`AttributeError`.
     """
 
-    def __init__(self, workbook: "Workbook", title: str) -> None:
+    def __init__(
+        self, workbook: "Workbook", title: str, *, inline_strings: bool = False
+    ) -> None:
         self._workbook = workbook
         self._title = title
         self._row_counter: int = 0
@@ -160,7 +162,7 @@ class WriteOnlyWorksheet:
         # Convert the underlying Rust-side worksheet into streaming mode.
         backend = getattr(workbook, "_rust_writer", None)
         if backend is not None:
-            backend.enable_streaming_sheet(title)
+            backend.enable_streaming_sheet(title, inline_strings=inline_strings)
         else:
             self._writer = SimpleNamespace(out=create_temporary_file())
 
@@ -237,14 +239,21 @@ class WriteOnlyWorksheet:
             if value is None:
                 cells_payload.append(None)
                 continue
-            if isinstance(value, WriteOnlyCell):
-                payload = python_value_to_payload(value.value)
+            styled = isinstance(value, WriteOnlyCell)
+            payload = python_value_to_payload(value.value if styled else value)
+            if payload["type"] == "formula":
+                formula = payload["formula"]
+                if "XLOOKUP" in formula.upper():
+                    from wolfxl._formula_cache import _future_formula
+
+                    # Qualify before writing the row so save can copy the
+                    # spool without opening sheet XML to rewrite formulas.
+                    payload["formula"] = "=" + _future_formula(formula.lstrip("="))
+            if styled:
                 style_id = self._resolve_style_id(value)
                 if style_id is not None:
                     payload["style_id"] = style_id
-                cells_payload.append(payload)
-            else:
-                cells_payload.append(python_value_to_payload(value))
+            cells_payload.append(payload)
 
         self._row_counter += 1
         backend = self._workbook._rust_writer  # noqa: SLF001

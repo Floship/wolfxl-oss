@@ -14,7 +14,7 @@ pub fn emit(out: &mut String, sheet: &Worksheet) {
     // bounding box on the StreamingSheet itself. Min row is implicitly
     // 1 because openpyxl's write_only API auto-numbers from row 1.
     if let Some(stream) = sheet.streaming.as_ref() {
-        let max_row = stream.row_count();
+        let max_row = stream.max_row();
         let max_col = stream.max_col();
         if max_row == 0 || max_col == 0 {
             out.push_str("<dimension ref=\"A1\"/>");

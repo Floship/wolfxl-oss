@@ -23,6 +23,7 @@
 //! workbooks); sheet XML uses a bounded in-memory fast path for small/medium
 //! sheets and inflates large sheets from the ZIP entry as rows are read.
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
@@ -140,7 +141,7 @@ fn load_sst<R: Read + Seek>(zip: &mut ZipArchive<R>) -> PyResult<Vec<String>> {
     };
 
     let mut out = Vec::new();
-    parse_sst(XmlReader::from_str(&xml), |value| {
+    parse_sst(xml.as_bytes(), None, |value| {
         out.push(value.to_owned());
         Ok(())
     })?;
@@ -148,9 +149,11 @@ fn load_sst<R: Read + Seek>(zip: &mut ZipArchive<R>) -> PyResult<Vec<String>> {
 }
 
 fn parse_sst<R: BufRead>(
-    mut reader: XmlReader<R>,
+    input: R,
+    bounded_entry_size: Option<u64>,
     mut consume: impl FnMut(&str) -> PyResult<()>,
 ) -> PyResult<()> {
+    let mut reader = XmlReader::from_reader(ooxml_util::XmlTokenReader::new(input));
     reader.config_mut().trim_text(false);
     let mut buf: Vec<u8> = Vec::new();
     let mut current = String::new();
@@ -159,6 +162,9 @@ fn parse_sst<R: BufRead>(
     let mut in_rph = false;
 
     loop {
+        if bounded_entry_size.is_some() {
+            reader.get_mut().limit_next_token();
+        }
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 let name = e.local_name();
@@ -192,12 +198,13 @@ fn parse_sst<R: BufRead>(
                 }
             }
             Ok(Event::Empty(e)) if e.local_name().as_ref() == "si" => consume("")?,
-            Ok(Event::Text(t)) => {
-                if in_si && in_t {
-                    current.push_str(&normalize_xml_eol(&t));
-                }
+            Ok(Event::Text(t)) if in_si && in_t && !in_rph => {
+                current.push_str(&normalize_xml_eol(&t));
             }
-            Ok(Event::GeneralRef(r)) if in_si && in_t => {
+            Ok(Event::CData(t)) if in_si && in_t && !in_rph => {
+                current.push_str(&normalize_xml_eol(&t));
+            }
+            Ok(Event::GeneralRef(r)) if in_si && in_t && !in_rph => {
                 let text = ooxml_util::resolve_general_ref(&r)
                     .map_err(|e| PyErr::new::<PyIOError, _>(format!("SST text decode: {e}")))?;
                 current.push_str(&text);
@@ -210,7 +217,20 @@ fn parse_sst<R: BufRead>(
             }
             _ => {}
         }
+        if bounded_entry_size.is_some() && current.len() > DISK_STRING_VALUE_BYTES {
+            return Err(PyIOError::new_err(
+                "shared string exceeds 128 KiB of decoded text",
+            ));
+        }
         buf.clear();
+    }
+    if bounded_entry_size.is_some_and(|size| reader.buffer_position() != size) {
+        return Err(PyIOError::new_err(
+            "sharedStrings.xml size differs from ZIP metadata",
+        ));
+    }
+    if bounded_entry_size.is_some() && in_si {
+        return Err(PyIOError::new_err("unterminated shared string entry"));
     }
     Ok(())
 }
@@ -247,80 +267,107 @@ fn resolve_sheet_xml_path<R: Read + Seek>(
     )))
 }
 
-/// Shared-string entries of one workbook. An entry becomes a Python `str` on
-/// its first reference and every later reference, from any reader sharing the
-/// table, returns that same object, so a string repeated across many cells is
-/// materialized once rather than once per cell. The native xlsx backend builds
-/// its table from the native reader's entries, so its eager reads and the
-/// streaming readers it hands the table to share one `str` per entry.
 const DISK_STRING_CACHE_SLOTS: usize = 1024;
-const DISK_STRING_CACHE_MAX_BYTES: usize = 256;
+const DISK_STRING_CACHE_VALUE_BYTES: usize = 256;
+const DISK_STRING_VALUE_BYTES: usize = 128 * 1024;
+const DISK_STRING_SPOOL_BYTES: u64 = 512 * 1024 * 1024;
+const DISK_STRING_ROW_BYTES: usize = 8 * 1024 * 1024;
 
 struct DiskStrings {
     offsets: File,
     values: File,
-    cache: Vec<Option<(usize, String)>>,
+    cache: Box<[Option<(usize, String)>]>,
     count: usize,
 }
 
 impl DiskStrings {
-    fn from_archive<R: Read + Seek>(zip: &mut ZipArchive<R>) -> PyResult<Self> {
+    fn from_archive<R: Read + Seek>(zip: &mut ZipArchive<R>) -> PyResult<Option<Self>> {
+        let Some(name) =
+            ooxml_util::resolve_zip_name_case_insensitive(zip, "xl/sharedStrings.xml")?
+        else {
+            return Ok(None);
+        };
+        let entry = zip
+            .by_name(&name)
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let size = entry.size();
+        ooxml_util::validate_zip_entry_metadata(&name, size, entry.compressed_size())?;
+        // Anonymous files close and disappear when the last table handle drops,
+        // including errors during construction and lookups.
         let mut offsets = BufWriter::new(tempfile::tempfile()?);
         let mut values = BufWriter::new(tempfile::tempfile()?);
         let mut next_offset = 0u64;
         let mut count = 0usize;
-        let name = ooxml_util::resolve_zip_name_case_insensitive(zip, "xl/sharedStrings.xml")?;
-        if let Some(name) = name {
-            let entry = zip
-                .by_name(&name)
-                .map_err(|err| PyIOError::new_err(err.to_string()))?;
-            ooxml_util::validate_zip_entry_metadata(&name, entry.size(), entry.compressed_size())?;
-            parse_sst(XmlReader::from_reader(BufReader::new(entry)), |value| {
+        parse_sst(
+            BufReader::new(entry.take(size.saturating_add(1))),
+            Some(size),
+            |value| {
+                let end = next_offset + value.len() as u64;
+                // One u64 per entry plus the final sentinel. Charge empty strings too.
+                let spool_bytes = end + (count as u64 + 2) * 8;
+                if spool_bytes > DISK_STRING_SPOOL_BYTES {
+                    return Err(PyIOError::new_err(
+                        "disk shared-string table exceeds 512 MiB",
+                    ));
+                }
                 offsets.write_all(&next_offset.to_le_bytes())?;
                 values.write_all(value.as_bytes())?;
-                next_offset += value.len() as u64;
+                next_offset = end;
                 count += 1;
                 Ok(())
-            })?;
-        }
+            },
+        )?;
         offsets.write_all(&next_offset.to_le_bytes())?;
-        Ok(Self {
+        Ok(Some(Self {
             offsets: offsets.into_inner().map_err(|err| err.into_error())?,
             values: values.into_inner().map_err(|err| err.into_error())?,
-            cache: vec![None; DISK_STRING_CACHE_SLOTS],
+            cache: vec![None; DISK_STRING_CACHE_SLOTS].into_boxed_slice(),
             count,
-        })
+        }))
     }
 
-    fn get_py(&mut self, py: Python<'_>, idx: usize) -> PyResult<PyObjectOwned> {
+    fn get(&mut self, idx: usize) -> io::Result<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+
         if idx >= self.count {
-            return str_to_py(py, "");
+            return Ok(Cow::Borrowed(""));
         }
         let slot = (idx ^ (idx >> 10)) % self.cache.len();
-        if let Some((key, text)) = self.cache[slot].as_ref() {
-            if *key == idx {
-                return str_to_py(py, text);
-            }
+        if self.cache[slot]
+            .as_ref()
+            .is_some_and(|(key, _)| *key == idx)
+        {
+            return Ok(Cow::Borrowed(&self.cache[slot].as_ref().unwrap().1));
         }
         let mut pair = [0u8; 16];
         self.offsets.seek(SeekFrom::Start(idx as u64 * 8))?;
         self.offsets.read_exact(&mut pair)?;
         let offset = u64::from_le_bytes(pair[..8].try_into().unwrap());
-        let next = u64::from_le_bytes(pair[8..].try_into().unwrap());
-        let mut bytes = vec![0; (next - offset) as usize];
+        let end = u64::from_le_bytes(pair[8..].try_into().unwrap());
+        let len = end
+            .checked_sub(offset)
+            .filter(|len| *len <= DISK_STRING_VALUE_BYTES as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid shared-string offsets")
+            })?;
+        let mut bytes = vec![0; len as usize];
         self.values.seek(SeekFrom::Start(offset))?;
         self.values.read_exact(&mut bytes)?;
-        let text = String::from_utf8(bytes).map_err(|err| PyIOError::new_err(err.to_string()))?;
-        let value = str_to_py(py, &text)?;
-        if text.len() <= DISK_STRING_CACHE_MAX_BYTES {
-            self.cache[slot] = Some((idx, text));
+        let text = String::from_utf8(bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        if text.len() <= DISK_STRING_CACHE_VALUE_BYTES {
+            return Ok(Cow::Borrowed(&self.cache[slot].insert((idx, text)).1));
         }
-        Ok(value)
+        Ok(Cow::Owned(text))
     }
 }
 
+/// Shared strings backing the native and streaming readers. The in-memory
+/// table reuses Python string identity. Disk mode caches only short UTF-8
+/// entries and serializes reads of its temporary files.
 pub(crate) struct SharedStringTable {
     disk: Option<Mutex<DiskStrings>>,
+    disk_mode: bool,
     disk_count: usize,
     strings: Vec<Arc<str>>,
     py_strings: Box<[PyOnceLock<PyObjectOwned>]>,
@@ -336,6 +383,7 @@ impl SharedStringTable {
         let py_strings = strings.iter().map(|_| PyOnceLock::new()).collect();
         Self {
             disk: None,
+            disk_mode: false,
             disk_count: 0,
             strings,
             py_strings,
@@ -348,12 +396,6 @@ impl SharedStringTable {
 
     /// Python `str` of entry `idx`; an index past the table reads as `""`.
     pub(crate) fn get_py(&self, py: Python<'_>, idx: usize) -> PyResult<PyObjectOwned> {
-        if let Some(disk) = &self.disk {
-            return disk
-                .lock()
-                .map_err(|_| PyIOError::new_err("shared strings lock poisoned"))?
-                .get_py(py, idx);
-        }
         let (Some(text), Some(slot)) = (self.strings.get(idx), self.py_strings.get(idx)) else {
             return str_to_py(py, "");
         };
@@ -369,9 +411,40 @@ impl SharedStringTable {
     }
 }
 
-/// Parsed `xl/sharedStrings.xml`, loaded once per workbook and shared by
-/// every [`StreamingSheetReader`] opened from the same source, together with
-/// the Python `str` of each entry already referenced.
+/// Decoded shared-string bytes charged to one output row.
+struct RowStrings<'a> {
+    table: &'a SharedStringTable,
+    bytes: Cell<usize>,
+}
+
+impl<'a> RowStrings<'a> {
+    fn new(table: &'a SharedStringTable) -> Self {
+        Self {
+            table,
+            bytes: Cell::new(0),
+        }
+    }
+
+    fn get_py(&self, py: Python<'_>, idx: usize) -> PyResult<PyObjectOwned> {
+        let Some(disk) = &self.table.disk else {
+            return self.table.get_py(py, idx);
+        };
+        let mut disk = disk
+            .lock()
+            .map_err(|_| PyIOError::new_err("shared strings lock poisoned"))?;
+        let text = disk.get(idx)?;
+        let bytes = self.bytes.get() + text.len();
+        if bytes > DISK_STRING_ROW_BYTES {
+            return Err(PyIOError::new_err(
+                "row exceeds 8 MiB of decoded shared strings",
+            ));
+        }
+        self.bytes.set(bytes);
+        str_to_py(py, &text)
+    }
+}
+
+/// Parsed `xl/sharedStrings.xml` shared by readers of the same workbook.
 #[pyclass(frozen, module = "wolfxl._rust")]
 pub struct StreamingSharedStrings {
     sst: Arc<SharedStringTable>,
@@ -398,21 +471,22 @@ impl StreamingSharedStrings {
         Self::from_archive(zip)
     }
 
-    /// Prototype for bounded-memory reads of high-cardinality shared strings.
+    /// Load an opt-in disk table from a workbook path.
     #[staticmethod]
     pub fn load_disk(path: &str) -> PyResult<Self> {
-        let file = File::open(path)?;
-        let mut zip = ZipArchive::new(file).map_err(|err| PyIOError::new_err(err.to_string()))?;
-        ooxml_util::validate_zip_archive(&mut zip)?;
-        let disk = DiskStrings::from_archive(&mut zip)?;
-        Ok(Self {
-            sst: Arc::new(SharedStringTable {
-                disk_count: disk.count,
-                disk: Some(Mutex::new(disk)),
-                strings: Vec::new(),
-                py_strings: Vec::new().into_boxed_slice(),
-            }),
-        })
+        Self::disk_from_source(File::open(path)?)
+    }
+
+    /// Load an opt-in disk table from the admitted bytes or mapped source.
+    #[staticmethod]
+    pub fn load_disk_from_bytes(data: PyWorkbookBytes) -> PyResult<Self> {
+        Self::disk_from_source(WorkbookBytesCursor::new(&data))
+    }
+
+    #[cfg(unix)]
+    #[staticmethod]
+    pub fn load_disk_from_file(source: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Self::disk_from_source(PositionalFile::duplicate(source)?)
     }
 
     fn __len__(&self) -> usize {
@@ -429,6 +503,21 @@ impl StreamingSharedStrings {
     }
 
     /// Handle over a table another backend already holds.
+    fn disk_from_source<R: Read + Seek>(source: R) -> PyResult<Self> {
+        let mut zip = ZipArchive::new(source).map_err(|err| PyIOError::new_err(err.to_string()))?;
+        ooxml_util::validate_zip_archive(&mut zip)?;
+        let disk = DiskStrings::from_archive(&mut zip)?;
+        Ok(Self {
+            sst: Arc::new(SharedStringTable {
+                disk_count: disk.as_ref().map_or(0, |table| table.count),
+                disk: disk.map(Mutex::new),
+                disk_mode: true,
+                strings: Vec::new(),
+                py_strings: Box::default(),
+            }),
+        })
+    }
+
     pub(crate) fn from_table(sst: Arc<SharedStringTable>) -> Self {
         Self { sst }
     }
@@ -463,6 +552,8 @@ pub struct StreamingSheetReader {
     date_styles: DateStyles,
     /// What values-only rows return for formula cells.
     value_output: CellOutput,
+    /// Raw XML plus shared text retained by the last bounded values row.
+    last_row_bytes: usize,
 }
 
 /// How `read_cell_contents` reports formula and error cells.
@@ -617,7 +708,7 @@ enum CellTypeAttr {
 /// to quick-xml) hands the rest of the stream to quick-xml for good.
 enum SheetXmlReader {
     Scan(RowScanner),
-    Events(XmlReader<BufReader<HandoffReader>>),
+    Events(XmlReader<ooxml_util::XmlTokenReader<BufReader<HandoffReader>>>),
 }
 
 impl SheetXmlReader {
@@ -625,12 +716,11 @@ impl SheetXmlReader {
         Self::Scan(RowScanner::new(initial, source))
     }
 
-    fn events(&mut self) -> &mut XmlReader<BufReader<HandoffReader>> {
+    fn events(&mut self) -> &mut XmlReader<ooxml_util::XmlTokenReader<BufReader<HandoffReader>>> {
         if let Self::Scan(scanner) = self {
             let scanner = std::mem::replace(scanner, RowScanner::new(Vec::new(), None));
-            let mut reader = XmlReader::from_reader(BufReader::with_capacity(
-                SHEET_ENTRY_BUFFER,
-                scanner.handoff(),
+            let mut reader = XmlReader::from_reader(ooxml_util::XmlTokenReader::new(
+                BufReader::with_capacity(SHEET_ENTRY_BUFFER, scanner.handoff()),
             ));
             reader.config_mut().trim_text(false);
             *self = Self::Events(reader);
@@ -641,16 +731,29 @@ impl SheetXmlReader {
         }
     }
 
-    fn read_event_into<'a>(&mut self, buf: &'a mut Vec<u8>) -> quick_xml::Result<Event<'a>> {
-        self.events().read_event_into(buf)
+    fn read_event_into<'a>(
+        &mut self,
+        buf: &'a mut Vec<u8>,
+        bounded: bool,
+    ) -> quick_xml::Result<Event<'a>> {
+        let reader = self.events();
+        if bounded {
+            reader.get_mut().limit_next_token();
+        }
+        reader.read_event_into(buf)
     }
 
     fn read_text_into<'a>(
         &mut self,
         end: quick_xml::name::QName<'_>,
         buf: &'a mut Vec<u8>,
+        bounded: bool,
     ) -> quick_xml::Result<quick_xml::events::BytesText<'a>> {
-        self.events().read_text_into(end, buf)
+        let reader = self.events();
+        if bounded {
+            reader.get_mut().limit_next_token();
+        }
+        reader.read_text_into(end, buf)
     }
 }
 
@@ -658,6 +761,8 @@ impl SheetXmlReader {
 /// while it is parsed after the archive itself has been released.
 enum EntrySource {
     File(io::Take<File>),
+    #[cfg(unix)]
+    PositionalFile(io::Take<PositionalFile>),
     /// A range of the caller's `bytes` or read-only mapping, shared rather
     /// than copied. Consumed input is reported so mapped pages can be released.
     Bytes {
@@ -672,6 +777,8 @@ impl Read for EntrySource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::File(source) => source.read(buf),
+            #[cfg(unix)]
+            Self::PositionalFile(source) => source.read(buf),
             Self::Bytes {
                 data,
                 pos,
@@ -707,6 +814,64 @@ impl IntoEntrySource for File {
     fn into_entry_source(mut self, start: u64, len: u64) -> io::Result<EntrySource> {
         self.seek(SeekFrom::Start(start))?;
         Ok(EntrySource::File(self.take(len)))
+    }
+}
+
+/// Independently seek a duplicate of the source descriptor without touching
+/// the original read position or resolving the caller's path again.
+#[cfg(unix)]
+pub(crate) struct PositionalFile {
+    file: File,
+    pos: u64,
+}
+
+#[cfg(unix)]
+impl PositionalFile {
+    pub(crate) fn duplicate(source: &Bound<'_, PyAny>) -> PyResult<Self> {
+        use std::os::fd::BorrowedFd;
+
+        let fd: std::os::fd::RawFd = source.call_method0("fileno")?.extract()?;
+        if fd < 0 {
+            return Err(PyValueError::new_err("invalid workbook file descriptor"));
+        }
+        // The caller retains an open file object throughout the duplication.
+        // fcntl returns an error if the descriptor was closed.
+        let owned = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+        Ok(Self {
+            file: File::from(owned),
+            pos: 0,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Read for PositionalFile {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        let read = self.file.read_at(out, self.pos)?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+#[cfg(unix)]
+impl Seek for PositionalFile {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        self.pos = match to {
+            SeekFrom::Start(pos) => Some(pos),
+            SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+            SeekFrom::End(delta) => self.file.metadata()?.len().checked_add_signed(delta),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid workbook seek"))?;
+        Ok(self.pos)
+    }
+}
+
+#[cfg(unix)]
+impl IntoEntrySource for PositionalFile {
+    fn into_entry_source(mut self, start: u64, len: u64) -> io::Result<EntrySource> {
+        self.seek(SeekFrom::Start(start))?;
+        Ok(EntrySource::PositionalFile(self.take(len)))
     }
 }
 
@@ -798,6 +963,12 @@ impl Read for SheetEntryReader {
             EntryDecoder::Deflated(source) => source.read(buf)?,
         };
         if n == 0 {
+            if self.produced != self.declared_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incorrect ZIP entry size",
+                ));
+            }
             if self.crc.clone().finalize() != self.expected_crc {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -865,6 +1036,33 @@ impl StreamingSheetReader {
     ) -> PyResult<Self> {
         let zip = ZipArchive::new(WorkbookBytesCursor::new(&data))
             .map_err(|e| PyErr::new::<PyIOError, _>(format!("Failed to open zip: {e}")))?;
+        Self::from_archive(
+            zip,
+            sheet,
+            min_row,
+            max_row,
+            min_col,
+            max_col,
+            shared_strings,
+        )
+    }
+
+    /// Stream directly from an already opened local file without moving its cursor.
+    #[cfg(unix)]
+    #[staticmethod]
+    #[pyo3(signature = (source, sheet, min_row=None, max_row=None, min_col=None, max_col=None, shared_strings=None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_file(
+        source: &Bound<'_, PyAny>,
+        sheet: &str,
+        min_row: Option<u32>,
+        max_row: Option<u32>,
+        min_col: Option<u32>,
+        max_col: Option<u32>,
+        shared_strings: Option<&StreamingSharedStrings>,
+    ) -> PyResult<Self> {
+        let zip = ZipArchive::new(PositionalFile::duplicate(source)?)
+            .map_err(|e| PyIOError::new_err(format!("Failed to open zip: {e}")))?;
         Self::from_archive(
             zip,
             sheet,
@@ -1050,13 +1248,19 @@ impl StreamingSheetReader {
         if self.exhausted {
             return Ok(None);
         }
-        let limit = max_rows.max(1);
+        let limit = if self.sst.disk_mode {
+            max_rows.clamp(1, 1024)
+        } else {
+            max_rows.max(1)
+        };
         let chunk = new_list(py)?;
         let mut cells = 0usize;
-        while chunk.len() < limit && cells < CHUNK_CELL_BUDGET {
+        let mut bytes = 0;
+        while chunk.len() < limit && cells < CHUNK_CELL_BUDGET && bytes < DISK_STRING_ROW_BYTES {
             match self.parse_one_value_row(py)? {
                 ValueStepResult::Row(row_idx, values) => {
                     cells += values.len();
+                    bytes += self.last_row_bytes;
                     let row_obj = u32_to_py(py, row_idx)?;
                     let item = new_tuple(py, [row_obj, values.into_any().unbind()].into_iter())?;
                     chunk.append(item)?;
@@ -1084,23 +1288,29 @@ impl StreamingSheetReader {
         if self.exhausted {
             return Ok(None);
         }
-        let limit = max_rows.max(1);
-        let mut rows: Vec<(u32, Bound<'py, PyTuple>)> = Vec::with_capacity(limit);
+        let limit = if self.sst.disk_mode {
+            max_rows.clamp(1, 1024)
+        } else {
+            max_rows.max(1)
+        };
+        let mut rows: Vec<(u32, Bound<'py, PyTuple>)> = Vec::with_capacity(limit.min(1024));
         let mut first_row = 0;
-        let mut last_row = 0;
+        let mut last_row = 0u32;
         let mut contiguous = true;
 
         let mut cells = 0usize;
-        while rows.len() < limit && cells < CHUNK_CELL_BUDGET {
+        let mut bytes = 0;
+        while rows.len() < limit && cells < CHUNK_CELL_BUDGET && bytes < DISK_STRING_ROW_BYTES {
             match self.parse_one_value_row(py)? {
                 ValueStepResult::Row(row_idx, values) => {
                     if rows.is_empty() {
                         first_row = row_idx;
-                    } else if row_idx != last_row + 1 {
+                    } else if Some(row_idx) != last_row.checked_add(1) {
                         contiguous = false;
                     }
                     last_row = row_idx;
                     cells += values.len();
+                    bytes += self.last_row_bytes;
                     rows.push((row_idx, values));
                 }
                 ValueStepResult::Skip => continue,
@@ -1157,7 +1367,10 @@ impl StreamingSheetReader {
     pub fn close(&mut self) {
         self.exhausted = true;
         self.reader = None;
-        self.event_buf.clear();
+        self.event_buf = Vec::new();
+        if self.sst.disk_mode {
+            self.sst = Arc::new(SharedStringTable::new(Vec::new()));
+        }
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -1205,6 +1418,9 @@ impl StreamingSheetReader {
             Some(shared) => Arc::clone(&shared.sst),
             None => Arc::new(SharedStringTable::new(load_sst(&mut zip)?)),
         };
+        if sst.disk_mode {
+            validate_stream_bounds(min_row, max_row, min_col, max_col)?;
+        }
         let sheet_path = resolve_sheet_xml_path(&mut zip, sheet)?;
         let mut sheet_entry = zip.by_name(&sheet_path).map_err(|e| {
             PyErr::new::<PyIOError, _>(format!("Failed to open sheet part '{sheet_path}': {e}"))
@@ -1245,6 +1461,7 @@ impl StreamingSheetReader {
             last_row: 0,
             date_styles: DateStyles::default(),
             value_output: CellOutput::FormulaText,
+            last_row_bytes: 0,
         })
     }
 
@@ -1257,24 +1474,30 @@ impl StreamingSheetReader {
         loop {
             self.event_buf.clear();
             let event = reader
-                .read_event_into(&mut self.event_buf)
+                .read_event_into(&mut self.event_buf, self.sst.disk_mode)
                 .map_err(|e| PyErr::new::<PyIOError, _>(format!("Streaming reader XML: {e}")))?;
             match event {
                 Event::Start(e) if e.local_name().as_ref() == "row" => {
                     let row_idx = row_index_from_start(&e, self.last_row)?;
+                    if self.sst.disk_mode {
+                        validate_stream_row(row_idx, self.last_row)?;
+                    }
                     self.last_row = row_idx;
                     drop(e);
                     let cells = read_cells_until_row_end(
                         reader,
                         &mut self.event_buf,
                         py,
-                        &self.sst,
+                        &RowStrings::new(&self.sst),
                         row_idx,
                     )?;
                     return self.row_result(row_idx, cells);
                 }
                 Event::Empty(e) if e.local_name().as_ref() == "row" => {
                     let row_idx = row_index_from_start(&e, self.last_row)?;
+                    if self.sst.disk_mode {
+                        validate_stream_row(row_idx, self.last_row)?;
+                    }
                     self.last_row = row_idx;
                     return self.row_result(row_idx, Vec::new());
                 }
@@ -1285,6 +1508,7 @@ impl StreamingSheetReader {
     }
 
     fn parse_one_value_row<'py>(&mut self, py: Python<'py>) -> PyResult<ValueStepResult<'py>> {
+        self.last_row_bytes = 0;
         if let Some(step) = self.scan_value_row(py)? {
             return Ok(step);
         }
@@ -1296,16 +1520,24 @@ impl StreamingSheetReader {
         loop {
             self.event_buf.clear();
             let event = reader
-                .read_event_into(&mut self.event_buf)
+                .read_event_into(&mut self.event_buf, self.sst.disk_mode)
                 .map_err(|e| PyErr::new::<PyIOError, _>(format!("Streaming reader XML: {e}")))?;
             match event {
                 Event::Start(e) if e.local_name().as_ref() == "row" => {
                     let row_idx = row_index_from_start(&e, self.last_row)?;
+                    if self.sst.disk_mode {
+                        validate_stream_row(row_idx, self.last_row)?;
+                    }
                     self.last_row = row_idx;
                     drop(e);
                     if let Some(min) = self.min_row {
                         if row_idx < min {
-                            skip_row_until_end(reader, &mut self.event_buf, row_idx)?;
+                            skip_row_until_end(
+                                reader,
+                                &mut self.event_buf,
+                                row_idx,
+                                self.sst.disk_mode,
+                            )?;
                             return Ok(ValueStepResult::Skip);
                         }
                     }
@@ -1316,21 +1548,30 @@ impl StreamingSheetReader {
                             return Ok(ValueStepResult::Done);
                         }
                     }
+                    let strings = RowStrings::new(&self.sst);
+                    let start = reader.events().buffer_position();
                     let values = read_values_until_row_end(
                         reader,
                         &mut self.event_buf,
                         py,
-                        &self.sst,
+                        &strings,
                         &self.date_styles,
                         self.value_output,
                         row_idx,
                         self.min_col,
                         self.max_col,
                     )?;
+                    if self.sst.disk_mode {
+                        self.last_row_bytes = strings.bytes.get()
+                            + (reader.events().buffer_position() - start) as usize;
+                    }
                     return Ok(ValueStepResult::Row(row_idx, values));
                 }
                 Event::Empty(e) if e.local_name().as_ref() == "row" => {
                     let row_idx = row_index_from_start(&e, self.last_row)?;
+                    if self.sst.disk_mode {
+                        validate_stream_row(row_idx, self.last_row)?;
+                    }
                     self.last_row = row_idx;
                     return self.empty_value_row_result(py, row_idx);
                 }
@@ -1354,6 +1595,9 @@ impl StreamingSheetReader {
         let previous = self.last_row;
         let tag = BytesStart::from_content(&text[window.tag.clone()], "row".len());
         let row_idx = row_index_from_start(&tag, previous)?;
+        if self.sst.disk_mode {
+            validate_stream_row(row_idx, previous)?;
+        }
         self.last_row = row_idx;
         if self.min_row.is_some_and(|min| row_idx < min) {
             // The window ends at the first `</row>` bytes, which a comment,
@@ -1374,16 +1618,22 @@ impl StreamingSheetReader {
         let values = if window.self_closing {
             empty_value_row(py, self.min_col, self.max_col)?
         } else {
+            let strings = RowStrings::new(&self.sst);
             match scan_value_row_body(
                 &text[window.body.clone()],
                 py,
-                &self.sst,
+                &strings,
                 &self.date_styles,
                 self.value_output,
                 self.min_col,
                 self.max_col,
             )? {
-                Some(values) => values,
+                Some(values) => {
+                    if self.sst.disk_mode {
+                        self.last_row_bytes = strings.bytes.get() + window.body.len();
+                    }
+                    values
+                }
                 None => {
                     self.last_row = previous;
                     return Ok(None);
@@ -1442,6 +1692,37 @@ impl StreamingSheetReader {
     }
 }
 
+fn validate_stream_bounds(
+    min_row: Option<u32>,
+    max_row: Option<u32>,
+    min_col: Option<u32>,
+    max_col: Option<u32>,
+) -> PyResult<()> {
+    if [min_row, max_row]
+        .into_iter()
+        .flatten()
+        .any(|row| row > 1_048_576)
+        || [min_col, max_col]
+            .into_iter()
+            .flatten()
+            .any(|col| col > 16_384)
+    {
+        return Err(PyValueError::new_err(
+            "bounded streaming range exceeds Excel worksheet bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stream_row(row: u32, previous: u32) -> PyResult<()> {
+    if row <= previous {
+        return Err(PyValueError::new_err(
+            "bounded streaming requires increasing worksheet rows",
+        ));
+    }
+    validate_stream_bounds(None, Some(row), None, None)
+}
+
 /// Whether a scanned row body is plain markup: complete tags (no comments,
 /// CDATA, or processing instructions) and text whose every `&` ends with `;`
 /// as quick-xml requires, so its first `</row>` is the row's real end tag.
@@ -1471,19 +1752,30 @@ fn read_cells_until_row_end(
     reader: &mut SheetXmlReader,
     buf: &mut Vec<u8>,
     py: Python<'_>,
-    sst: &SharedStringTable,
+    sst: &RowStrings<'_>,
     row_idx: u32,
 ) -> PyResult<Vec<ParsedCell>> {
     let mut cells: Vec<ParsedCell> = Vec::new();
 
+    let start = reader.events().buffer_position();
     loop {
         buf.clear();
         let event = reader
-            .read_event_into(buf)
+            .read_event_into(buf, sst.table.disk_mode)
             .map_err(|e| PyErr::new::<PyIOError, _>(format!("Streaming reader XML: {e}")))?;
+        if sst.table.disk_mode
+            && reader.events().buffer_position() - start > ooxml_util::STREAM_ROW_XML_BYTES
+        {
+            return Err(PyIOError::new_err(
+                "bounded streaming worksheet row exceeds XML byte limit",
+            ));
+        }
         match event {
             Event::Start(e) if e.local_name().as_ref() == "c" => {
                 let (col, style_id, t_attr) = cell_attrs_from_start(&e, &cells)?;
+                if sst.table.disk_mode {
+                    validate_stream_bounds(None, None, None, Some(col))?;
+                }
                 drop(e);
                 let (value, cell_type) =
                     read_cell_contents(reader, buf, py, &t_attr, sst, CellOutput::Payload)?;
@@ -1496,6 +1788,9 @@ fn read_cells_until_row_end(
             }
             Event::Empty(e) if e.local_name().as_ref() == "c" => {
                 let (col, style_id, t_attr) = cell_attrs_from_start(&e, &cells)?;
+                if sst.table.disk_mode {
+                    validate_stream_bounds(None, None, None, Some(col))?;
+                }
                 cells.push(ParsedCell {
                     col,
                     value: py.None(),
@@ -1518,11 +1813,12 @@ fn skip_row_until_end(
     reader: &mut SheetXmlReader,
     buf: &mut Vec<u8>,
     row_idx: u32,
+    bounded: bool,
 ) -> PyResult<()> {
     loop {
         buf.clear();
         let event = reader
-            .read_event_into(buf)
+            .read_event_into(buf, bounded)
             .map_err(|e| PyErr::new::<PyIOError, _>(format!("Streaming reader XML: {e}")))?;
         match event {
             Event::End(e) if e.local_name().as_ref() == "row" => return Ok(()),
@@ -1540,7 +1836,7 @@ fn read_values_until_row_end<'py>(
     reader: &mut SheetXmlReader,
     buf: &mut Vec<u8>,
     py: Python<'py>,
-    sst: &SharedStringTable,
+    sst: &RowStrings<'_>,
     date_styles: &DateStyles,
     output: CellOutput,
     row_idx: u32,
@@ -1552,14 +1848,25 @@ fn read_values_until_row_end<'py>(
     let mut last_col = cmin.saturating_sub(1);
     let mut next_col = 1;
 
+    let start = reader.events().buffer_position();
     loop {
         buf.clear();
         let event = reader
-            .read_event_into(buf)
+            .read_event_into(buf, sst.table.disk_mode)
             .map_err(|e| PyErr::new::<PyIOError, _>(format!("Streaming reader XML: {e}")))?;
+        if sst.table.disk_mode
+            && reader.events().buffer_position() - start > ooxml_util::STREAM_ROW_XML_BYTES
+        {
+            return Err(PyIOError::new_err(
+                "bounded streaming worksheet row exceeds XML byte limit",
+            ));
+        }
         match event {
             Event::Start(e) if e.local_name().as_ref() == "c" => {
                 let (col, style_id, t_attr) = cell_value_attrs_from_start(&e, next_col)?;
+                if sst.table.disk_mode {
+                    validate_stream_bounds(None, None, None, Some(col))?;
+                }
                 next_col = col.saturating_add(1);
                 drop(e);
                 let (value, cell_type) = read_cell_contents(reader, buf, py, &t_attr, sst, output)?;
@@ -1574,6 +1881,9 @@ fn read_values_until_row_end<'py>(
             }
             Event::Empty(e) if e.local_name().as_ref() == "c" => {
                 let (col, _style_id, _t_attr) = cell_value_attrs_from_start(&e, next_col)?;
+                if sst.table.disk_mode {
+                    validate_stream_bounds(None, None, None, Some(col))?;
+                }
                 next_col = col.saturating_add(1);
                 push_bounded_value(
                     py,
@@ -1655,7 +1965,7 @@ fn empty_value_row<'py>(
 fn scan_value_row_body<'py>(
     body: &str,
     py: Python<'py>,
-    sst: &SharedStringTable,
+    sst: &RowStrings<'_>,
     date_styles: &DateStyles,
     output: CellOutput,
     min_col: Option<u32>,
@@ -1676,6 +1986,9 @@ fn scan_value_row_body<'py>(
         };
         let (col, style_id, t_attr) =
             cell_value_attrs_from_start(&BytesStart::from_content(tag, "c".len()), next_col)?;
+        if sst.table.disk_mode {
+            validate_stream_bounds(None, None, None, Some(col))?;
+        }
         next_col = col.saturating_add(1);
         if self_closing {
             push_bounded_value(
@@ -1695,6 +2008,11 @@ fn scan_value_row_body<'py>(
         else {
             return Ok(None);
         };
+        if sst.table.disk_mode && (end - lt) as u64 > ooxml_util::STREAM_CELL_XML_BYTES {
+            return Err(PyIOError::new_err(
+                "bounded streaming worksheet cell exceeds XML byte limit",
+            ));
+        }
         let value = date_styles.apply(
             py,
             style_id,
@@ -1720,7 +2038,7 @@ fn scan_cell_value(
     start: usize,
     py: Python<'_>,
     t_attr: &CellTypeAttr,
-    sst: &SharedStringTable,
+    sst: &RowStrings<'_>,
     output: CellOutput,
 ) -> PyResult<Option<(PyObjectOwned, &'static str, usize)>> {
     let bytes = text.as_bytes();
@@ -1951,7 +2269,7 @@ fn read_cell_contents(
     buf: &mut Vec<u8>,
     py: Python<'_>,
     t_attr: &CellTypeAttr,
-    sst: &SharedStringTable,
+    sst: &RowStrings<'_>,
     output: CellOutput,
 ) -> PyResult<(PyObjectOwned, &'static str)> {
     let mut v_text: Option<String> = None;
@@ -1966,11 +2284,19 @@ fn read_cell_contents(
     let mut in_t = false;
     let mut in_rph = false;
 
+    let start = reader.events().buffer_position();
     loop {
         buf.clear();
         let event = reader
-            .read_event_into(buf)
+            .read_event_into(buf, sst.table.disk_mode)
             .map_err(|e| PyErr::new::<PyIOError, _>(format!("Streaming reader XML: {e}")))?;
+        if sst.table.disk_mode
+            && reader.events().buffer_position() - start > ooxml_util::STREAM_CELL_XML_BYTES
+        {
+            return Err(PyIOError::new_err(
+                "bounded streaming worksheet cell exceeds XML byte limit",
+            ));
+        }
         match event {
             Event::Start(e) => match e.local_name().as_ref().as_bytes() {
                 b"v" => {
@@ -1985,7 +2311,7 @@ fn read_cell_contents(
                     drop(e);
                     buf.clear();
                     let raw = reader
-                        .read_text_into(quick_xml::name::QName(&end), buf)
+                        .read_text_into(quick_xml::name::QName(&end), buf, sst.table.disk_mode)
                         .map_err(|e| {
                             PyErr::new::<PyIOError, _>(format!("Streaming reader XML: {e}"))
                         })?;
@@ -2610,7 +2936,7 @@ fn parse_cell_inner(
     py: Python<'_>,
     inner: &[u8],
     t_attr: &str,
-    sst: &SharedStringTable,
+    sst: &RowStrings<'_>,
 ) -> PyResult<(PyObjectOwned, &'static str)> {
     let v_text = extract_inner_text(inner, b"v");
     let f_text = extract_inner_text(inner, b"f");
@@ -2638,7 +2964,7 @@ fn value_cell_object(
     fast_number: Option<PyObjectOwned>,
     fast_shared: Option<usize>,
     raw_value: Option<String>,
-    sst: &SharedStringTable,
+    sst: &RowStrings<'_>,
 ) -> PyResult<(PyObjectOwned, &'static str)> {
     if has_formula && output == CellOutput::FormulaText {
         let formula = formula.unwrap_or_default();
@@ -2695,7 +3021,7 @@ fn build_cell_object(
     t_attr: &CellTypeAttr,
     formula: Option<String>,
     raw_value: Option<String>,
-    sst: &SharedStringTable,
+    sst: &RowStrings<'_>,
 ) -> PyResult<(PyObjectOwned, &'static str)> {
     // Value text as openpyxl reads it: an empty `<v>` is no value.
     let raw_value =
@@ -2757,7 +3083,7 @@ fn cached_value_to_py(
     py: Python<'_>,
     t_attr: &CellTypeAttr,
     raw_value: Option<String>,
-    sst: &SharedStringTable,
+    sst: &RowStrings<'_>,
 ) -> PyResult<PyObjectOwned> {
     let Some(v) = raw_value else {
         return Ok(py.None());
@@ -2932,9 +3258,13 @@ mod tests {
     fn parse_cell_inner_number() {
         pyo3::Python::initialize();
         Python::attach(|py| {
-            let (obj, kind) =
-                parse_cell_inner(py, b"<v>42</v>", "n", &SharedStringTable::new(Vec::new()))
-                    .unwrap();
+            let (obj, kind) = parse_cell_inner(
+                py,
+                b"<v>42</v>",
+                "n",
+                &RowStrings::new(&SharedStringTable::new(Vec::new())),
+            )
+            .unwrap();
             let value: i64 = obj.extract(py).unwrap();
             assert_eq!(kind, "n");
             assert_eq!(value, 42);
@@ -2994,9 +3324,8 @@ mod tests {
         } else {
             RowScanner::new(xml.to_vec(), None)
         };
-        SheetXmlReader::Events(XmlReader::from_reader(BufReader::with_capacity(
-            3,
-            scanner.handoff(),
+        SheetXmlReader::Events(XmlReader::from_reader(ooxml_util::XmlTokenReader::new(
+            BufReader::with_capacity(3, scanner.handoff()),
         )))
     }
 
@@ -3080,7 +3409,7 @@ mod tests {
                     let mut reader = tiny_buffer_events(xml.as_bytes(), use_entry);
                     let mut buf = Vec::new();
                     assert!(matches!(
-                        reader.read_event_into(&mut buf).unwrap(),
+                        reader.read_event_into(&mut buf, false).unwrap(),
                         Event::Start(_)
                     ));
                     let sst =
@@ -3090,7 +3419,7 @@ mod tests {
                         &mut buf,
                         py,
                         &kind,
-                        &sst,
+                        &RowStrings::new(&sst),
                         CellOutput::Payload,
                     )
                     .unwrap();
@@ -3116,7 +3445,7 @@ mod tests {
                 let mut reader = SheetXmlReader::new(xml.into_bytes(), None);
                 let mut buf = Vec::new();
                 assert!(matches!(
-                    reader.read_event_into(&mut buf).unwrap(),
+                    reader.read_event_into(&mut buf, false).unwrap(),
                     Event::Start(_)
                 ));
                 assert!(read_cell_contents(
@@ -3124,7 +3453,7 @@ mod tests {
                     &mut buf,
                     py,
                     &CellTypeAttr::Number,
-                    &SharedStringTable::new(Vec::new()),
+                    &RowStrings::new(&SharedStringTable::new(Vec::new())),
                     CellOutput::Payload,
                 )
                 .is_err());
@@ -3141,7 +3470,7 @@ mod tests {
                 let mut reader = SheetXmlReader::new(xml.to_vec(), None);
                 let mut buf = Vec::new();
                 assert!(matches!(
-                    reader.read_event_into(&mut buf).unwrap(),
+                    reader.read_event_into(&mut buf, false).unwrap(),
                     Event::Start(_)
                 ));
                 read_cell_contents(
@@ -3149,7 +3478,7 @@ mod tests {
                     &mut buf,
                     py,
                     &CellTypeAttr::Number,
-                    &SharedStringTable::new(Vec::new()),
+                    &RowStrings::new(&SharedStringTable::new(Vec::new())),
                     output,
                 )
                 .unwrap()
@@ -3252,6 +3581,7 @@ mod tests {
             last_row: 0,
             date_styles: DateStyles::default(),
             value_output: output,
+            last_row_bytes: 0,
         }
     }
 
